@@ -12,6 +12,5 @@ add_executable(EX3_OS
         Barrier/Barrier.cpp
         Barrier/Barrier.h
         Barrier/barrierdemo.cpp
-        "Sample Client/SampleClient.cpp"
         MapReduceClient.h
         MapReduceFramework.h)
