@@ -17,12 +17,12 @@ struct ThreadContext;
 void* threadRun(void* _arg);
 unsigned long getInputPairIndex(ThreadContext *tc);
 unsigned long getInputPairIndex_after_reduce(ThreadContext *tc);
-void map_next_pair(ThreadContext *tc, unsigned long index);
+void processInputPair(ThreadContext *tc, unsigned long index);
 void reduce_next_pair(ThreadContext *tc, IntermediateVec cur_pairs);
 void init_shuffle_data(JobContext *jobContext);
 void shuffle_state(JobContext* jobContext);
 void start_reduce_stage(JobContext *jobContext);
-void sort_cur_thread_array(ThreadContext *tc);
+void sortIntermediatePairsByKeys(ThreadContext *tc);
 void check_destroy(int check_input);
 
 /**
@@ -32,10 +32,14 @@ class Barrier {
 public:
 	Barrier(int numThreads);
     void barrier(JobContext *jobContext);
+    void barrier();
+    ~Barrier();
 
 private:
-	int count;
-	int numThreads;
+    pthread_mutex_t mutex;
+    pthread_cond_t cv;
+    int count;
+    int numThreads;
 };
 
 /**
@@ -70,47 +74,94 @@ struct ThreadContext {
     IntermediateVec intermediateVec;  // READY order of threadHandles
 };
 
-/**
- * constructor
- * @param numThreads - num of the thread that work in this job
- */
-Barrier::Barrier(int numThreads):
-         count(0)
-        , numThreads(numThreads){}
 
-/**
- * lock all the thread until the lest one, the lest one make the shuffle
- * change the state and the atomic counter before and after. once shuffle state finish unlock all the thread.
- * all the function in mutex
- * @param jobContext - struct that hold all the information in this job
- */
+Barrier::Barrier(int numThreads)
+        : mutex(PTHREAD_MUTEX_INITIALIZER)
+        , cv(PTHREAD_COND_INITIALIZER)
+        , count(0)
+        , numThreads(numThreads)
+{ }
+
+Barrier::~Barrier()
+{
+    if (pthread_mutex_destroy(&mutex) != 0) {
+        fprintf(stderr, "[[Barrier]] error on pthread_mutex_destroy");
+        exit(1);
+    }
+    if (pthread_cond_destroy(&cv) != 0){
+        fprintf(stderr, "[[Barrier]] error on pthread_cond_destroy");
+        exit(1);
+    }
+}
+
+
 void Barrier::barrier(JobContext* jobContext)
 {
-    if (pthread_mutex_lock(&jobContext->barrierMutex) != 0){
+    if (pthread_mutex_lock(&mutex) != 0){
         fprintf(stderr, "[[Barrier]] error on pthread_mutex_lock");
         exit(1);
     }
     if (++count < numThreads) {
-        //lock all the thread
-        if (pthread_cond_wait(&jobContext->conditionVar, &jobContext->barrierMutex) != 0){
+        if (pthread_cond_wait(&cv, &mutex) != 0){
             fprintf(stderr, "[[Barrier]] error on pthread_cond_wait");
             exit(1);
         }
     } else {
-        //the last thread do the shuffle
+        count = 0;
         shuffle_state(jobContext);
         start_reduce_stage(jobContext);
-        //unlock all the thread for reduce state
-        if (pthread_cond_broadcast(&jobContext->conditionVar) != 0) {
+        if (pthread_cond_broadcast(&cv) != 0) {
             fprintf(stderr, "[[Barrier]] error on pthread_cond_broadcast");
             exit(1);
         }
     }
-    if (pthread_mutex_unlock(&jobContext->barrierMutex) != 0) {
+    if (pthread_mutex_unlock(&mutex) != 0) {
         fprintf(stderr, "[[Barrier]] error on pthread_mutex_unlock");
         exit(1);
     }
 }
+
+// /**
+//  * constructor
+//  * @param numThreads - num of the thread that work in this job
+//  */
+// Barrier::Barrier(int numThreads):
+//          count(0)
+//         , numThreads(numThreads){}
+//
+// /**
+//  * lock all the thread until the lest one, the lest one make the shuffle
+//  * change the state and the atomic counter before and after. once shuffle state finish unlock all the thread.
+//  * all the function in mutex
+//  * @param jobContext - struct that hold all the information in this job
+//  */
+// void Barrier::barrier(JobContext* jobContext)
+// {
+//     if (pthread_mutex_lock(&jobContext->barrierMutex) != 0){
+//         fprintf(stderr, "[[Barrier]] error on pthread_mutex_lock");
+//         exit(1);
+//     }
+//     if (++count < numThreads) {
+//         //lock all the thread
+//         if (pthread_cond_wait(&jobContext->conditionVar, &jobContext->barrierMutex) != 0){
+//             fprintf(stderr, "[[Barrier]] error on pthread_cond_wait");
+//             exit(1);
+//         }
+//     } else {
+//         //the last thread do the shuffle
+//         shuffle_state(jobContext);
+//         start_reduce_stage(jobContext);
+//         //unlock all the thread for reduce state
+//         if (pthread_cond_broadcast(&jobContext->conditionVar) != 0) {
+//             fprintf(stderr, "[[Barrier]] error on pthread_cond_broadcast");
+//             exit(1);
+//         }
+//     }
+//     if (pthread_mutex_unlock(&jobContext->barrierMutex) != 0) {
+//         fprintf(stderr, "[[Barrier]] error on pthread_mutex_unlock");
+//         exit(1);
+//     }
+// }
 
 /**
  * Inserts a key-value pair into the intermediate array of the calling thread.
@@ -218,28 +269,42 @@ JobHandle startMapReduceJob(const MapReduceClient& client,
 }
 
 
+
+void executeMapping(ThreadContext *threadContext) {
+    // Set the job stage to MAP_STAGE
+    threadContext->jobContext->jobState.stage = MAP_STAGE;
+
+    // Initialize the index for input pairs
+    unsigned long inputIndex = 0;
+    unsigned long inputSize = threadContext->jobContext->inputVec->size();
+
+    // Loop through input vector until all pairs are processed
+    while (true) {
+        // Retrieve the next index to process
+        inputIndex = getInputPairIndex(threadContext);
+
+        // Check if the retrieved index is within bounds
+        if (inputIndex >= inputSize) {
+            break;
+        }
+        // Process the input pair at the retrieved index
+        processInputPair(threadContext, inputIndex);
+    }
+}
+
 /**
  * the function of the theard that run the map and reduce
  * @param _arg - ThreadContext struct that belong to the thread
  */
 void* threadRun(void* _arg){
     auto* threadContext = (ThreadContext*) _arg;
-    // map state
-    threadContext->jobContext->jobState.stage = MAP_STAGE;
-    unsigned long InputPairIndex = 0;
-    while(InputPairIndex < (threadContext->jobContext->inputVec)->size()){
-        //take the next index to take from vector
-        InputPairIndex = getInputPairIndex(threadContext);
-        if(InputPairIndex >= (threadContext->jobContext->inputVec)->size()){
-            break;
-        }
 
-        map_next_pair(threadContext, InputPairIndex);
-    }
-    // sort state
-    sort_cur_thread_array(threadContext);
-    // barrier after map and sort
+    executeMapping(threadContext);
+
+    sortIntermediatePairsByKeys(threadContext);
+
     threadContext->jobContext->barrier->barrier(threadContext->jobContext);
+
     //finish the shuffle state and start reduce state
     unsigned long OutputPairIndex = 0;
     unsigned long shuffle_len = (threadContext->jobContext->shuffleArray.size());
@@ -256,27 +321,17 @@ void* threadRun(void* _arg){
 }
 
 /**
- * take the next index and add 1 to the atomic counter
- * @param tc - ThreadContext struct that belong to the thread
- * @return the next index in the array that the thread need to work on
+ * Retrieves the next available index and increments the atomic counter.
+ * @param tc - Pointer to the ThreadContext structure associated with the thread.
+ * @return The next index in the array that the thread should process.
  */
 unsigned long getInputPairIndex(ThreadContext *tc) {
-    // get next valid input
-    if (pthread_mutex_lock(&tc->jobContext->counterMutex) != 0){
-        fprintf(stderr, "[[Before Map, Before Get Next Input]] error on pthread_mutex_lock");
-        exit(1);
-    }
-    unsigned long mask;
-    mask = (1 << 31) - 1;
-    unsigned long cur_value = (tc->jobContext->counterAtomic->load());
+    unsigned long mask = (1 << 31) - 1;
+    unsigned long cur_value = (tc->jobContext->counterAtomic->fetch_add(1, std::memory_order_relaxed));
     unsigned long next_value_index = cur_value & mask; // first 31 bit - the num of unmapped values
-    (*(tc->jobContext->counterAtomic))++;
-    if (pthread_mutex_unlock(&tc->jobContext->counterMutex) != 0) {
-        fprintf(stderr, "[[Before Map, After Get Next Input]] error on pthread_mutex_unlock");
-        exit(1);
-    }
     return next_value_index;
 }
+
 
 /**
  * take the next index and add 1 to the atomic counter
@@ -306,7 +361,7 @@ unsigned long getInputPairIndex_after_reduce(ThreadContext *tc) {
  * @param tc - ThreadContext struct that belong to the thread
  * @param cur_pair pair of key value that map function get
  */
-void map_next_pair(ThreadContext *tc, unsigned long i) {
+void processInputPair(ThreadContext *tc, unsigned long i) {
     // use map on cur_pair
 (*(tc->jobContext->mapReduceClient)).map((tc->jobContext->inputVec)->at(i).first, (tc->jobContext->inputVec)->at(i).second, tc);
 
@@ -446,22 +501,17 @@ void start_reduce_stage(JobContext *jobContext){
 }
 
 /**
- * @param pair1 - IntermediatePair
- * @param pair2 -IntermediatePair
- * @return pair1 key > pair2 key
+ * Sorts the intermediate vector for the current thread based on keys
+ * @param threadCtx - ThreadContext structure associated with the thread
  */
-bool cmp(const IntermediatePair &pair1, const IntermediatePair &pair2) {
-    return *pair1.first < *pair2.first;
+void sortIntermediatePairsByKeys(ThreadContext *threadCtx) {
+    std::sort(threadCtx->intermediateVec.begin(),
+              threadCtx->intermediateVec.end(),
+              [](const IntermediatePair &a, const IntermediatePair &b) {
+                  return *(a.first) < *(b.first);
+              });
 }
 
-/**
- * sort the intermediateVec
- * @param tc ThreadContext struct that belong to the thread
- */
-void sort_cur_thread_array(ThreadContext *tc) {
-    std::sort((tc->intermediateVec).begin(),
-              (tc->intermediateVec).end(), cmp); // also sorts by key
-}
 
 /**
  * hold the current running until the job will be finished.
