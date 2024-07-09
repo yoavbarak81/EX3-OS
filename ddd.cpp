@@ -22,7 +22,7 @@ void reduce_next_pair(ThreadContext *tc, IntermediateVec cur_pairs);
 void init_shuffle_data(JobContext *jobContext);
 void shuffle_state(JobContext* jobContext);
 void start_reduce_stage(JobContext *jobContext);
-void sortIntermediatePairsByKeys(ThreadContext *tc);
+void sortIntermediatePairsByKeys(ThreadContext *threadCtx);
 void check_destroy(int check_input);
 
 /**
@@ -32,7 +32,6 @@ class Barrier {
 public:
 	Barrier(int numThreads);
     void barrier(JobContext *jobContext);
-    void barrier();
     ~Barrier();
 
 private:
@@ -71,7 +70,7 @@ struct JobContext{
 struct ThreadContext {
     int threadID;
     JobContext* jobContext;
-    IntermediateVec intermediateVec;  // READY order of threadHandles
+    IntermediateVec intermediateVec;
 };
 
 
@@ -121,47 +120,6 @@ void Barrier::barrier(JobContext* jobContext)
     }
 }
 
-// /**
-//  * constructor
-//  * @param numThreads - num of the thread that work in this job
-//  */
-// Barrier::Barrier(int numThreads):
-//          count(0)
-//         , numThreads(numThreads){}
-//
-// /**
-//  * lock all the thread until the lest one, the lest one make the shuffle
-//  * change the state and the atomic counter before and after. once shuffle state finish unlock all the thread.
-//  * all the function in mutex
-//  * @param jobContext - struct that hold all the information in this job
-//  */
-// void Barrier::barrier(JobContext* jobContext)
-// {
-//     if (pthread_mutex_lock(&jobContext->barrierMutex) != 0){
-//         fprintf(stderr, "[[Barrier]] error on pthread_mutex_lock");
-//         exit(1);
-//     }
-//     if (++count < numThreads) {
-//         //lock all the thread
-//         if (pthread_cond_wait(&jobContext->conditionVar, &jobContext->barrierMutex) != 0){
-//             fprintf(stderr, "[[Barrier]] error on pthread_cond_wait");
-//             exit(1);
-//         }
-//     } else {
-//         //the last thread do the shuffle
-//         shuffle_state(jobContext);
-//         start_reduce_stage(jobContext);
-//         //unlock all the thread for reduce state
-//         if (pthread_cond_broadcast(&jobContext->conditionVar) != 0) {
-//             fprintf(stderr, "[[Barrier]] error on pthread_cond_broadcast");
-//             exit(1);
-//         }
-//     }
-//     if (pthread_mutex_unlock(&jobContext->barrierMutex) != 0) {
-//         fprintf(stderr, "[[Barrier]] error on pthread_mutex_unlock");
-//         exit(1);
-//     }
-// }
 
 /**
  * Inserts a key-value pair into the intermediate array of the calling thread.
@@ -172,18 +130,12 @@ void Barrier::barrier(JobContext* jobContext)
  */
 void emit2(K2* key, V2* value, void* context) {
     auto* threadContext = static_cast<ThreadContext*>(context);
-
-    // Create a new IntermediatePair
     IntermediatePair intermediatePair = std::make_pair(key, value);
-
-    // Add the new key to the intermediateArray of the thread
     if (pthread_mutex_lock(&threadContext->jobContext->vectorMutex) != 0) {
         fprintf(stderr, "[emit2: Failed to lock vectorMutex before adding pair]");
         exit(EXIT_FAILURE);
     }
-
-    threadContext->intermediateVec.push_back(intermediatePair); // Add new value to array of mapped values of this thread
-
+    threadContext->intermediateVec.push_back(intermediatePair);
     if (pthread_mutex_unlock(&threadContext->jobContext->vectorMutex) != 0) {
         fprintf(stderr, "[emit2: Failed to unlock vectorMutex after adding pair]");
         exit(EXIT_FAILURE);
@@ -200,18 +152,12 @@ void emit2(K2* key, V2* value, void* context) {
  */
 void emit3(K3* key, V3* value, void* context) {
     auto* threadContext = static_cast<ThreadContext*>(context);
-
-    // Create a new OutputPair
     OutputPair newOutputPair = std::make_pair(key, value);;
-
-    // Add the new pair to the output vector of the job context
     if (pthread_mutex_lock(&threadContext->jobContext->vectorMutex) != 0) {
         fprintf(stderr, "[emit3: Failed to lock vectorMutex before adding output pair]");
         exit(EXIT_FAILURE);
     }
-
-    threadContext->jobContext->outputVec->push_back(newOutputPair); // Add new value to output vector
-
+    threadContext->jobContext->outputVec->push_back(newOutputPair);
     if (pthread_mutex_unlock(&threadContext->jobContext->vectorMutex) != 0) {
         fprintf(stderr, "[emit3: Failed to unlock vectorMutex after adding output pair]");
         exit(EXIT_FAILURE);
@@ -271,23 +217,14 @@ JobHandle startMapReduceJob(const MapReduceClient& client,
 
 
 void executeMapping(ThreadContext *threadContext) {
-    // Set the job stage to MAP_STAGE
     threadContext->jobContext->jobState.stage = MAP_STAGE;
-
-    // Initialize the index for input pairs
     unsigned long inputIndex = 0;
     unsigned long inputSize = threadContext->jobContext->inputVec->size();
-
-    // Loop through input vector until all pairs are processed
     while (true) {
-        // Retrieve the next index to process
         inputIndex = getInputPairIndex(threadContext);
-
-        // Check if the retrieved index is within bounds
         if (inputIndex >= inputSize) {
             break;
         }
-        // Process the input pair at the retrieved index
         processInputPair(threadContext, inputIndex);
     }
 }
