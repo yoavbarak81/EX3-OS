@@ -19,11 +19,10 @@ unsigned long getInputPairIndex(ThreadContext *tc);
 unsigned long getInputPairIndex_after_reduce(ThreadContext *tc);
 void processInputPair(ThreadContext *tc, unsigned long index);
 void reduce_next_pair(ThreadContext *tc, IntermediateVec cur_pairs);
-void init_shuffle_data(JobContext *jobContext);
-void shuffle_state(JobContext* jobContext);
-void start_reduce_stage(JobContext *jobContext);
+void executeShuffleOperation(JobContext* jobContext);
 void sortIntermediatePairsByKeys(ThreadContext *threadCtx);
 void check_destroy(int check_input);
+void InitReduceStage(JobContext *jobContext);
 
 /**
  * class Barrier - make a barrier before the shuffle and release the thread after finish the shuffle
@@ -33,6 +32,7 @@ public:
 	Barrier(int numThreads);
     void barrier(JobContext *jobContext);
     ~Barrier();
+
 
 private:
     pthread_mutex_t mutex;
@@ -94,6 +94,7 @@ Barrier::~Barrier()
 }
 
 
+
 void Barrier::barrier(JobContext* jobContext)
 {
     if (pthread_mutex_lock(&mutex) != 0){
@@ -107,8 +108,9 @@ void Barrier::barrier(JobContext* jobContext)
         }
     } else {
         count = 0;
-        shuffle_state(jobContext);
-        start_reduce_stage(jobContext);
+        executeShuffleOperation(jobContext);
+        InitReduceStage(jobContext);
+
         if (pthread_cond_broadcast(&cv) != 0) {
             fprintf(stderr, "[[Barrier]] error on pthread_cond_broadcast");
             exit(1);
@@ -229,19 +231,7 @@ void executeMapping(ThreadContext *threadContext) {
     }
 }
 
-/**
- * the function of the theard that run the map and reduce
- * @param _arg - ThreadContext struct that belong to the thread
- */
-void* threadRun(void* _arg){
-    auto* threadContext = (ThreadContext*) _arg;
-
-    executeMapping(threadContext);
-
-    sortIntermediatePairsByKeys(threadContext);
-
-    threadContext->jobContext->barrier->barrier(threadContext->jobContext);
-
+void executeReduce(ThreadContext *threadContext) {
     //finish the shuffle state and start reduce state
     unsigned long OutputPairIndex = 0;
     unsigned long shuffle_len = (threadContext->jobContext->shuffleArray.size());
@@ -255,6 +245,22 @@ void* threadRun(void* _arg){
         const IntermediateVec cur_pairs_vec = threadContext->jobContext->shuffleArray.at(OutputPairIndex);
         reduce_next_pair(threadContext, cur_pairs_vec);
     }
+}
+
+/**
+ * the function of the theard that run the map and reduce
+ * @param _arg - ThreadContext struct that belong to the thread
+ */
+void* threadRun(void* _arg){
+    auto* threadContext = (ThreadContext*) _arg;
+
+    executeMapping(threadContext);
+
+    sortIntermediatePairsByKeys(threadContext);
+
+    threadContext->jobContext->barrier->barrier(threadContext->jobContext);
+
+    executeReduce(threadContext);
 }
 
 /**
@@ -338,100 +344,137 @@ void reduce_next_pair(ThreadContext *tc, const IntermediateVec cur_pairs) {
     }
 }
 
+void InitReduceStage(JobContext *jobContext) {
+    jobContext->maxSize = jobContext->shuffleArray.size();
+    jobContext->counterAtomic->store(0);
+    jobContext->counterAtomic->fetch_add(0x8000000000000000); // + 8 equal 1000, 0 equal 0000, we have 3+4*15=63 zero
+    jobContext->counterAtomic->fetch_add(0x4000000000000000); // + 4 equal 0100, 0 equal 0000, we have 2+4*15=62 zero
+    jobContext->jobState = {REDUCE_STAGE, 0.0f};
+}
+
+
 /**
- * change the state to shuffle and init the atomic counter to 0 finish and
- * count all the pair and add in the 31 bit the count
- * @param jobContext - struct that hold all the information in this job
+ * Configures the environment for the shuffle operation and resets progress counters.
+ * @param jobDetails - Struct containing the state and data of the current job
  */
-void init_shuffle_data(JobContext *jobContext) {//change the state of job to shuffle
-    if (pthread_mutex_lock(&jobContext->stageMutex) != 0){
-        fprintf(stderr, "[[After Map, Before Shuffle]] error on pthread_mutex_lock");
-        exit(1);
+void configureShuffleEnvironment(JobContext *jobDetails) {
+    if (pthread_mutex_lock(&jobDetails->stageMutex) != 0){
+        perror("Failed to lock stage mutex at shuffle initialization");
+        exit(EXIT_FAILURE);
     }
-    (jobContext->counterAtomic)->operator=(0);
-    (*(jobContext->counterAtomic)) += 0x8000000000000000;  // + 8 equal 1000, 0 equal 0000, we have 3+4*15=63 zero
-    jobContext->jobState = {SHUFFLE_STAGE, 0};
-    unsigned long count = 0;
-    for (int i = 0; i < jobContext->multiThreadLevel;i++){
-        count += (jobContext->threadContexts + i)->intermediateVec.size();
+
+    // Initialize the counter and set the upper bit to mark start of shuffle
+    jobDetails->counterAtomic->store(0x8000000000000000);
+
+    // Update the job state to indicate the shuffle stage has begun
+    jobDetails->jobState.stage = SHUFFLE_STAGE;
+    jobDetails->jobState.percentage = 0;
+
+    // Compute the total number of key-value pairs across all threads
+    unsigned long pairCount = 0;
+    for (int idx = 0; idx < jobDetails->multiThreadLevel; idx++) {
+        pairCount += (jobDetails->threadContexts + idx)->intermediateVec.size();
     }
-    jobContext->maxSize = count;
-    (*(jobContext->counterAtomic)) += 0x80000000 * count;  // + 8 equal 1000, 0 equal 0000, we have 3+4*7=31 zero
-    if (pthread_mutex_unlock(&jobContext->stageMutex) != 0){
-        fprintf(stderr, "[[After Map, Before Shuffle]] error on pthread_mutex_unlock");
-        exit(1);
+    jobDetails->maxSize = pairCount;
+
+    // Adjust the counter to include the pair count at a specific bit position
+    jobDetails->counterAtomic->fetch_add(pairCount << 31);
+
+    if (pthread_mutex_unlock(&jobDetails->stageMutex) != 0){
+        perror("Failed to unlock stage mutex after shuffle setup");
+        exit(EXIT_FAILURE);
     }
 }
 
+
 /**
- * in loop take the biggest key chack in ak the thread and add all the pair with this key
- * to vector and add the vector to the shuffleArray
- * @param jobContext - struct that hold all the information in this job
+ * Helper function to find the largest key in the current intermediate vectors.
+ * This version uses a direct reference to keep track of the largest pair, simplifying the logic.
+ * @param jobContext - Contains all thread contexts and their vectors.
+ * @return The largest intermediate pair found across all threads.
  */
-void shuffle_state(JobContext* jobContext){
-    std::vector<IntermediatePair> cur_array;
-    float finish_count = 0;
-    IntermediatePair biggest_pair;
-    init_shuffle_data(jobContext);
+IntermediatePair findLargestKey(JobContext* jobContext) {
+    IntermediatePair* largestPair = nullptr;
+
+    for (int i = 0; i < jobContext->multiThreadLevel; ++i) {
+        IntermediateVec& vec = (jobContext->threadContexts + i)->intermediateVec;
+        if (!vec.empty() && (!largestPair || *largestPair->first < *vec.back().first )) {
+            largestPair = &vec.back();
+        }
+    }
+
+    return largestPair ? *largestPair : IntermediatePair(nullptr, nullptr); // Return an empty pair if none found
+}
+
+/**
+ * Collects all pairs with the same key as the provided largest pair.
+ * This version uses iterators for clarity and better control over vector manipulation.
+ * @param jobContext - Contains all thread contexts and their vectors.
+ * @param largestPair - The key to match against.
+ * @return A vector of all pairs matching the largest key.
+ */
+std::vector<IntermediatePair> collectPairsWithKey(JobContext* jobContext, const IntermediatePair& largestPair) {
+    std::vector<IntermediatePair> collectedPairs;
+
+    for (int i = 0; i < jobContext->multiThreadLevel; ++i) {
+        IntermediateVec& vec = jobContext->threadContexts[i].intermediateVec;
+
+        // Use a reverse iterator to efficiently pop from the back of the vector
+        for (auto rit = vec.rbegin(); rit != vec.rend(); ) {
+            if (!(*rit->first < *largestPair.first) && !(*largestPair.first < *rit->first)) {
+                collectedPairs.push_back(*rit);
+                rit = std::vector<IntermediatePair>::reverse_iterator(vec.erase((++rit).base())); // Erase and move iterator back to the next element
+            } else {
+                break; // Since we're assuming vec is sorted or we are looking for the largest key until mismatch
+            }
+        }
+    }
+
+    return collectedPairs;
+}
+
+
+/**
+ * Updates the shuffle progress in the job context based on current state.
+ * @param jobContext - Context containing job details and current progress.
+ */
+void updateShuffleProgress(JobContext* jobContext) {
+    jobContext->jobState.percentage = static_cast<float>(jobContext->shuffleArray.size()) / jobContext->maxSize * 100.0f;
+}
+
+/**
+ * Executes the shuffle operation, organizing data into shuffled arrays by key.
+ * @param jobContext - struct that holds all the information in this job.
+ */
+void executeShuffleOperation(JobContext* jobContext) {
+    configureShuffleEnvironment(jobContext);
+
     while (jobContext->jobState.percentage < 100) {
-        //find same key to start
-        for(int i = 0; i < jobContext->multiThreadLevel; i++){
-            cur_array = jobContext->threadContexts[i].intermediateVec;
-            if(cur_array.size() > 0){
-                biggest_pair = cur_array.at(cur_array.size()-1);
-                break;
-            }
+        IntermediatePair largestPair = findLargestKey(jobContext);
+        if (!largestPair.first) { // No more pairs available, stop the shuffle
+            break;
         }
-        //take the biggest key
-        for (int i = 0; i < jobContext->multiThreadLevel; i++) {
-            cur_array = (jobContext->threadContexts + i)->intermediateVec;
-            if (!cur_array.empty()){
-                if (!(*cur_array.at(cur_array.size()-1).first < *biggest_pair.first)) {
-                    biggest_pair = cur_array.at(cur_array.size() - 1);
-                }
-            }
+
+        std::vector<IntermediatePair> matchedPairs = collectPairsWithKey(jobContext, largestPair);
+        if (!matchedPairs.empty()) {
+            jobContext->shuffleArray.push_back(matchedPairs);
+            updateShuffleProgress(jobContext);
         }
-        //made vector for this key
-        std::vector<IntermediatePair> key_biggest_vector;
-        for (int i = 0; i < jobContext->multiThreadLevel; i++) {
-            cur_array = (jobContext->threadContexts + i)->intermediateVec;
-            //finish this array
-            while (!cur_array.empty() && !(*cur_array.at(cur_array.size()-1).first < *biggest_pair.first) &&
-            !(*biggest_pair.first < *cur_array.at(cur_array.size()-1).first)) {
-                //check if the least one of all the thread vector is good for this vector
-                bool check_eq = !(*cur_array.at(cur_array.size()-1).first < *biggest_pair.first) &&
-                        !(*biggest_pair.first < *cur_array.at(cur_array.size()-1).first);
-                if(check_eq){
-                    //insert to the vector, delete, update the percentage
-                    key_biggest_vector.push_back(cur_array.at(cur_array.size()-1));
-                    cur_array.pop_back();
-                    (jobContext->threadContexts + i)->intermediateVec.pop_back();
-                    (*(jobContext->counterAtomic))++;
-                    finish_count += 1;
-                    jobContext->jobState.percentage = finish_count/(float) jobContext->maxSize * 100;
-                }
-            }
-        }
-        jobContext->shuffleArray.push_back(key_biggest_vector);
     }
 }
+
 
 /**
  *  change the state to reduce and init the atomic counter to 0
  * @param jobContext - struct that hold all the information in this job
  */
 void start_reduce_stage(JobContext *jobContext){
-    jobContext->maxSize = jobContext->shuffleArray.size();
     //change the state and counterAtomic to reduce
     if (pthread_mutex_lock(&jobContext->stageMutex) != 0){
         fprintf(stderr, "[[After Shuffle, Before Reduce]] error on pthread_mutex_lock");
         exit(1);
     }
-    (jobContext->counterAtomic)->operator=(0);
-    (*(jobContext->counterAtomic)) += 0x8000000000000000;  // + 8 equal 1000, 0 equal 0000, we have 3+4*15=63 zero
-    (*(jobContext->counterAtomic)) += 0x4000000000000000;  // + 4 equal 0100, 0 equal 0000, we have 2+4*15=62 zero
-    jobContext->jobState = {REDUCE_STAGE, 0.0f};
-    if (pthread_mutex_unlock(&jobContext->stageMutex) != 0){
+       if (pthread_mutex_unlock(&jobContext->stageMutex) != 0){
         fprintf(stderr, "[[After Shuffle, Before Reduce]] error on pthread_mutex_lock");
         exit(1);
     }
