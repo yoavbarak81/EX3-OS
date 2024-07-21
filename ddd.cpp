@@ -18,7 +18,7 @@ void* threadRun(void* _arg);
 unsigned long getInputPairIndex(ThreadContext *tc);
 unsigned long getInputPairIndex_after_reduce(ThreadContext *tc);
 void processInputPair(ThreadContext *tc, unsigned long index);
-void reduce_next_pair(ThreadContext *tc, IntermediateVec cur_pairs);
+void reducePair(ThreadContext *tc, IntermediateVec cur_pairs);
 void executeShuffleOperation(JobContext* jobContext);
 void sortIntermediatePairsByKeys(ThreadContext *threadCtx);
 void check_destroy(int check_input);
@@ -232,18 +232,15 @@ void executeMapping(ThreadContext *threadContext) {
 }
 
 void executeReduce(ThreadContext *threadContext) {
-    //finish the shuffle state and start reduce state
     unsigned long OutputPairIndex = 0;
-    unsigned long shuffle_len = (threadContext->jobContext->shuffleArray.size());
-    while(OutputPairIndex < shuffle_len){
-        //take the next index to take from vector
-        OutputPairIndex = getInputPairIndex_after_reduce(threadContext);
-        if(OutputPairIndex >= shuffle_len){
+    while(OutputPairIndex < threadContext->jobContext->shuffleArray.size()){
+        OutputPairIndex = getInputPairIndex(threadContext);
+        if(OutputPairIndex >= threadContext->jobContext->shuffleArray.size()){
             break;
         }
         std::vector<std::vector<IntermediatePair>> cur_vec = threadContext->jobContext->shuffleArray;
         const IntermediateVec cur_pairs_vec = threadContext->jobContext->shuffleArray.at(OutputPairIndex);
-        reduce_next_pair(threadContext, cur_pairs_vec);
+        reducePair(threadContext, cur_pairs_vec);
     }
 }
 
@@ -270,33 +267,32 @@ void* threadRun(void* _arg){
  */
 unsigned long getInputPairIndex(ThreadContext *tc) {
     unsigned long mask = (1 << 31) - 1;
-    unsigned long cur_value = (tc->jobContext->counterAtomic->fetch_add(1, std::memory_order_relaxed));
-    unsigned long next_value_index = cur_value & mask; // first 31 bit - the num of unmapped values
-    return next_value_index;
+    unsigned long curValue = (tc->jobContext->counterAtomic->fetch_add(1, std::memory_order_relaxed));
+    unsigned long nextValueIndex = curValue & mask; // first 31 bit - the num of unmapped values
+    return nextValueIndex;
 }
 
 
-/**
- * take the next index and add 1 to the atomic counter
- * @param tc - ThreadContext struct that belong to the thread
- * @return the next index in the array that the thread need to work on
- */
-unsigned long getInputPairIndex_after_reduce(ThreadContext *tc) {
-    // get next valid input
-    if (pthread_mutex_lock(&tc->jobContext->counterMutex) != 0){
-        fprintf(stderr, "[[Before Reduce, Before Get Next Input]] error on pthread_mutex_lock");
-        exit(1);
+void atomicCounterHandler(ThreadContext *tc) {
+    if (pthread_mutex_lock(&tc->jobContext->counterMutex) != 0) {
+        fprintf(stderr, "[updateAtomicCounter] Error: Unable to lock counterMutex (code %d).\n");
+        exit(EXIT_FAILURE);
     }
-    unsigned long mask;
-    mask = (1 << 31) - 1;
-    unsigned long cur_value = (tc->jobContext->counterAtomic->load());
-    unsigned long next_value_index = cur_value & mask; // first 31 bit - the num of unmapped values
-    (*(tc->jobContext->counterAtomic))++;
-    if (pthread_mutex_unlock(&tc->jobContext->counterMutex) != 0) {
-        fprintf(stderr, "[[Before Reduce, After Get Next Input]] error on pthread_mutex_unlock");
-        exit(1);
+
+    unsigned long incrementValue = 0x80000000;
+    tc->jobContext->counterAtomic->fetch_add(incrementValue, std::memory_order_relaxed);
+
+    unsigned long counterValue = tc->jobContext->counterAtomic->load(std::memory_order_relaxed);
+    unsigned long processedPairs = (counterValue >> 31) & 0x7fffffff;
+
+    float completionRate = (static_cast<float>(processedPairs) / static_cast<float>(tc->jobContext->maxSize)) * 100.0f;
+    tc->jobContext->jobState.percentage = completionRate;
+
+    if ( pthread_mutex_unlock(&tc->jobContext->counterMutex) != 0) {
+        fprintf(stderr, "[updateAtomicCounter] Error: Unable to unlock counterMutex (code %d).\n");
+        exit(EXIT_FAILURE);
     }
-    return next_value_index;
+
 }
 
 /**
@@ -305,21 +301,9 @@ unsigned long getInputPairIndex_after_reduce(ThreadContext *tc) {
  * @param cur_pair pair of key value that map function get
  */
 void processInputPair(ThreadContext *tc, unsigned long i) {
-    // use map on cur_pair
-(*(tc->jobContext->mapReduceClient)).map((tc->jobContext->inputVec)->at(i).first, (tc->jobContext->inputVec)->at(i).second, tc);
+    (*(tc->jobContext->mapReduceClient)).map((tc->jobContext->inputVec)->at(i).first, (tc->jobContext->inputVec)->at(i).second, tc);
 
-    if (pthread_mutex_lock(&tc->jobContext->counterMutex) != 0){
-        fprintf(stderr, "[[After Map, Before +1 processed pairs]] error on pthread_mutex_lock");
-        exit(1);
-    }
-    //add one to the finish map pairs
-    (*(tc->jobContext->counterAtomic)) += 0x80000000;  // + 8 equal 1000, 0 equal 0000, we have 3+4*7=31 zero
-    unsigned long done_precessed = (tc->jobContext->counterAtomic)->load() >> 31 & (0x7fffffff);
-    tc->jobContext->jobState.percentage = ((float)done_precessed) / (float)tc->jobContext->maxSize *100;
-    if (pthread_mutex_unlock(&tc->jobContext->counterMutex) != 0){
-        fprintf(stderr, "[[After Map, After +1 processed pairs]] error on pthread_mutex_lock");
-        exit(1);
-    }
+    atomicCounterHandler(tc);
 }
 
 /**
@@ -327,28 +311,16 @@ void processInputPair(ThreadContext *tc, unsigned long i) {
  * @param tc - ThreadContext struct that belong to the thread
  * @param cur_pair pair of key value that reduce function get
  */
-void reduce_next_pair(ThreadContext *tc, const IntermediateVec cur_pairs) {
-    // use map on cur_pair
-    (*(tc->jobContext->mapReduceClient)).reduce(&cur_pairs, tc);
-    if (pthread_mutex_lock(&tc->jobContext->counterMutex) != 0){
-        fprintf(stderr, "[[After Reduce, Before +1 processed pairs]] error on pthread_mutex_lock");
-        exit(1);
-    }
-    //add one to the finish reduce pairs
-    (*(tc->jobContext->counterAtomic)) += 0x80000000;  // + 8 equal 1000, 0 equal 0000, we have 3+4*7=31 zero
-    unsigned long done_precessed = (tc->jobContext->counterAtomic)->load() >> 31 & (0x7fffffff);
-    tc->jobContext->jobState.percentage = ((float)done_precessed) / (float)tc->jobContext->maxSize * 100;
-    if (pthread_mutex_unlock(&tc->jobContext->counterMutex) != 0){
-        fprintf(stderr, "[[After Reduce, After +1 processed pairs]] error on pthread_mutex_lock");
-        exit(1);
-    }
+void reducePair(ThreadContext *tc, const IntermediateVec curPair) {
+    (*(tc->jobContext->mapReduceClient)).reduce(&curPair, tc);
+    atomicCounterHandler(tc);
 }
 
 void InitReduceStage(JobContext *jobContext) {
     jobContext->maxSize = jobContext->shuffleArray.size();
     jobContext->counterAtomic->store(0);
-    jobContext->counterAtomic->fetch_add(0x8000000000000000); // + 8 equal 1000, 0 equal 0000, we have 3+4*15=63 zero
-    jobContext->counterAtomic->fetch_add(0x4000000000000000); // + 4 equal 0100, 0 equal 0000, we have 2+4*15=62 zero
+    jobContext->counterAtomic->fetch_add(0x8000000000000000);
+    jobContext->counterAtomic->fetch_add(0x4000000000000000);
     jobContext->jobState = {REDUCE_STAGE, 0.0f};
 }
 
@@ -464,21 +436,6 @@ void executeShuffleOperation(JobContext* jobContext) {
 }
 
 
-/**
- *  change the state to reduce and init the atomic counter to 0
- * @param jobContext - struct that hold all the information in this job
- */
-void start_reduce_stage(JobContext *jobContext){
-    //change the state and counterAtomic to reduce
-    if (pthread_mutex_lock(&jobContext->stageMutex) != 0){
-        fprintf(stderr, "[[After Shuffle, Before Reduce]] error on pthread_mutex_lock");
-        exit(1);
-    }
-       if (pthread_mutex_unlock(&jobContext->stageMutex) != 0){
-        fprintf(stderr, "[[After Shuffle, Before Reduce]] error on pthread_mutex_lock");
-        exit(1);
-    }
-}
 
 /**
  * Sorts the intermediate vector for the current thread based on keys
