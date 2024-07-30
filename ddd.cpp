@@ -14,22 +14,33 @@ struct JobContext;
 struct ThreadContext;
 
 // helper functions
-void* threadRun(void* _arg);
+void *threadRun(void *_arg);
+
 unsigned long getInputPairIndex(ThreadContext *threadContext);
+
 void processInputPair(ThreadContext *threadContext, unsigned long index);
+
 void reducePair(ThreadContext *threadContext, IntermediateVec curPair);
-void executeShuffleOperation(JobContext* jobContext);
+
+void executeShuffleOperation(JobContext *jobContext);
+
 void sortIntermediatePairsByKeys(ThreadContext *threadCtx);
-void check_destroy(int check_input);
+
+void DestroyMutex(int checkReturnValue);
+
 void InitReduceStage(JobContext *jobContext);
+
+void waitFirstThread(JobContext *curJob);
 
 /**
  * class Barrier - make a barrier before the shuffle and release the thread after finish the shuffle
  */
 class Barrier {
 public:
-	explicit Barrier(int numThreads);
+    explicit Barrier(int numThreads);
+
     void barrier(JobContext *jobContext);
+
     ~Barrier();
 
 
@@ -43,23 +54,24 @@ private:
 /**
  *  struct that hold all the information in this job
  */
-struct JobContext{
+struct JobContext {
     std::vector<std::vector<IntermediatePair>> shuffleArray;
-    std::atomic<uint64_t>* counterAtomic;
+    std::atomic<uint64_t> *counterAtomic;
     int multiThreadLevel;
     int waitFlag;
     unsigned long maxSize;
-    const InputVec* inputVec;
-    const MapReduceClient* mapReduceClient;
-    Barrier* barrier;
-    ThreadContext* threadContexts;
+    const InputVec *inputVec;
+    const MapReduceClient *mapReduceClient;
+    Barrier *barrier;
+    ThreadContext *threadContexts;
     JobState jobState;
-    OutputVec* outputVec;
-    pthread_t* threadHandles;
+    OutputVec *outputVec;
+    pthread_t *threadHandles;
     pthread_mutex_t barrierMutex;
     pthread_mutex_t vectorMutex;
     pthread_mutex_t counterMutex;
     pthread_mutex_t stageMutex;
+    pthread_mutex_t waitMutex;
     pthread_cond_t conditionVar;
 };
 
@@ -67,41 +79,33 @@ struct JobContext{
  * struct for each thread that has his intermediateVec and  pointer to the job
  */
 struct ThreadContext {
-    int threadID;
-    JobContext* jobContext;
+    JobContext *jobContext;
     IntermediateVec intermediateVec;
 };
 
 
 Barrier::Barrier(int numThreads)
-        : mutex(PTHREAD_MUTEX_INITIALIZER)
-        , cv(PTHREAD_COND_INITIALIZER)
-        , count(0)
-        , numThreads(numThreads)
-{ }
+        : mutex(PTHREAD_MUTEX_INITIALIZER), cv(PTHREAD_COND_INITIALIZER), count(0), numThreads(numThreads) {}
 
-Barrier::~Barrier()
-{
+Barrier::~Barrier() {
     if (pthread_mutex_destroy(&mutex) != 0) {
         fprintf(stderr, "[[Barrier]] error on pthread_mutex_destroy");
         exit(1);
     }
-    if (pthread_cond_destroy(&cv) != 0){
+    if (pthread_cond_destroy(&cv) != 0) {
         fprintf(stderr, "[[Barrier]] error on pthread_cond_destroy");
         exit(1);
     }
 }
 
 
-
-void Barrier::barrier(JobContext* jobContext)
-{
-    if (pthread_mutex_lock(&mutex) != 0){
+void Barrier::barrier(JobContext *jobContext) {
+    if (pthread_mutex_lock(&mutex) != 0) {
         fprintf(stderr, "[[Barrier]] error on pthread_mutex_lock");
         exit(1);
     }
     if (++count < numThreads) {
-        if (pthread_cond_wait(&cv, &mutex) != 0){
+        if (pthread_cond_wait(&cv, &mutex) != 0) {
             fprintf(stderr, "[[Barrier]] error on pthread_cond_wait");
             exit(1);
         }
@@ -129,8 +133,8 @@ void Barrier::barrier(JobContext* jobContext)
  * @param value - the value part of the intermediate pair.
  * @param context - the context structure of the calling thread, which contains the intermediate array.
  */
-void emit2(K2* key, V2* value, void* context) {
-    auto* threadContext = static_cast<ThreadContext*>(context);
+void emit2(K2 *key, V2 *value, void *context) {
+    auto *threadContext = static_cast<ThreadContext *>(context);
     IntermediatePair intermediatePair = std::make_pair(key, value);
     if (pthread_mutex_lock(&threadContext->jobContext->vectorMutex) != 0) {
         fprintf(stderr, "[emit2: Failed to lock vectorMutex before adding pair]");
@@ -151,8 +155,8 @@ void emit2(K2* key, V2* value, void* context) {
  * @param value - the value component of the output pair.
  * @param context - the context of the calling thread, which includes the output array.
  */
-void emit3(K3* key, V3* value, void* context) {
-    auto* threadContext = static_cast<ThreadContext*>(context);
+void emit3(K3 *key, V3 *value, void *context) {
+    auto *threadContext = static_cast<ThreadContext *>(context);
     OutputPair newOutputPair = std::make_pair(key, value);
     if (pthread_mutex_lock(&threadContext->jobContext->vectorMutex) != 0) {
         fprintf(stderr, "[emit3: Failed to lock vectorMutex before adding output pair]");
@@ -174,19 +178,19 @@ void emit3(K3* key, V3* value, void* context) {
  * @param multiThreadLevel - the number of threads to create.
  * @return - a struct that holds all the information for this job.
  */
-JobHandle startMapReduceJob(const MapReduceClient& client,
-                            const InputVec& inputVec, OutputVec& outputVec,
+JobHandle startMapReduceJob(const MapReduceClient &client,
+                            const InputVec &inputVec, OutputVec &outputVec,
                             int multiThreadLevel) {
     // Allocate resources for job context
-    auto* barrier = new Barrier(multiThreadLevel);
-    auto* threads = new pthread_t[multiThreadLevel];
-    auto* atomicCounter = new std::atomic<uint64_t>(0);
-    auto* threadContexts = new ThreadContext[multiThreadLevel];
-    auto* jobContext = new JobContext;
+    auto *barrier = new Barrier(multiThreadLevel);
+    auto *threads = new pthread_t[multiThreadLevel];
+    auto *atomicCounter = new std::atomic<uint64_t>(0);
+    auto *threadContexts = new ThreadContext[multiThreadLevel];
+    auto *jobContext = new JobContext;
 
     // Initialize thread contexts
     for (int i = 0; i < multiThreadLevel; ++i) {
-        threadContexts[i] = {i, jobContext};
+        threadContexts[i] = {jobContext};
     }
 
     // Set job context fields
@@ -203,6 +207,7 @@ JobHandle startMapReduceJob(const MapReduceClient& client,
     jobContext->barrierMutex = PTHREAD_MUTEX_INITIALIZER;
     jobContext->vectorMutex = PTHREAD_MUTEX_INITIALIZER;
     jobContext->stageMutex = PTHREAD_MUTEX_INITIALIZER;
+    jobContext->waitMutex = PTHREAD_MUTEX_INITIALIZER;
     jobContext->counterMutex = PTHREAD_MUTEX_INITIALIZER;
     jobContext->maxSize = inputVec.size();
     jobContext->jobState = {UNDEFINED_STAGE, 0};
@@ -214,7 +219,6 @@ JobHandle startMapReduceJob(const MapReduceClient& client,
 
     return jobContext;
 }
-
 
 
 void executeMapping(ThreadContext *threadContext) {
@@ -232,9 +236,9 @@ void executeMapping(ThreadContext *threadContext) {
 
 void executeReduce(ThreadContext *threadContext) {
     unsigned long OutputPairIndex = 0;
-    while(OutputPairIndex < threadContext->jobContext->shuffleArray.size()){
+    while (OutputPairIndex < threadContext->jobContext->shuffleArray.size()) {
         OutputPairIndex = getInputPairIndex(threadContext);
-        if(OutputPairIndex >= threadContext->jobContext->shuffleArray.size()){
+        if (OutputPairIndex >= threadContext->jobContext->shuffleArray.size()) {
             break;
         }
         std::vector<std::vector<IntermediatePair>> cur_vec = threadContext->jobContext->shuffleArray;
@@ -247,8 +251,8 @@ void executeReduce(ThreadContext *threadContext) {
  * the function of the theard that run the map and reduce
  * @param _arg - ThreadContext struct that belong to the thread
  */
-void* threadRun(void* _arg){
-    auto* threadContext = (ThreadContext*) _arg;
+void *threadRun(void *_arg) {
+    auto *threadContext = (ThreadContext *) _arg;
 
     executeMapping(threadContext);
 
@@ -266,8 +270,9 @@ void* threadRun(void* _arg){
  */
 unsigned long getInputPairIndex(ThreadContext *threadContext) {
     unsigned long mask = (1 << 31) - 1;
-    unsigned long curValue = (threadContext->jobContext->counterAtomic->fetch_add(1, std::memory_order_relaxed));
-    unsigned long nextValueIndex = curValue & mask; // first 31 bit - the num of unmapped values
+    unsigned long curValue = (threadContext->jobContext->counterAtomic->fetch_add(1,
+                                                                                  std::memory_order_relaxed));
+    unsigned long nextValueIndex = curValue & mask;
     return nextValueIndex;
 }
 
@@ -284,7 +289,9 @@ void atomicCounterHandler(ThreadContext *threadContext) {
     unsigned long counterValue = threadContext->jobContext->counterAtomic->load(std::memory_order_relaxed);
     unsigned long processedPairs = (counterValue >> 31) & 0x7fffffff;
 
-    float completionRate = (static_cast<float>(processedPairs) / static_cast<float>(threadContext->jobContext->maxSize)) * 100.0f;
+    float completionRate =
+            (static_cast<float>(processedPairs) / static_cast<float>(threadContext->jobContext->maxSize)) *
+            100.0f;
     threadContext->jobContext->jobState.percentage = completionRate;
 
     if (pthread_mutex_unlock(&threadContext->jobContext->counterMutex) != 0) {
@@ -330,7 +337,7 @@ void InitReduceStage(JobContext *jobContext) {
  * @param jobDetails - Struct containing the state and data of the current job
  */
 void configureShuffleEnvironment(JobContext *jobDetails) {
-    if (pthread_mutex_lock(&jobDetails->stageMutex) != 0){
+    if (pthread_mutex_lock(&jobDetails->stageMutex) != 0) {
         perror("Failed to lock stage mutex at shuffle initialization");
         exit(EXIT_FAILURE);
     }
@@ -352,7 +359,7 @@ void configureShuffleEnvironment(JobContext *jobDetails) {
     // Adjust the counter to include the pair count at a specific bit position
     jobDetails->counterAtomic->fetch_add(pairCount << 31);
 
-    if (pthread_mutex_unlock(&jobDetails->stageMutex) != 0){
+    if (pthread_mutex_unlock(&jobDetails->stageMutex) != 0) {
         perror("Failed to unlock stage mutex after shuffle setup");
         exit(EXIT_FAILURE);
     }
@@ -365,17 +372,18 @@ void configureShuffleEnvironment(JobContext *jobDetails) {
  * @param jobContext - Contains all thread contexts and their vectors.
  * @return The largest intermediate pair found across all threads.
  */
-IntermediatePair findLargestKey(JobContext* jobContext) {
-    IntermediatePair* largestPair = nullptr;
+IntermediatePair findLargestKey(JobContext *jobContext) {
+    IntermediatePair *largestPair = nullptr;
 
     for (int i = 0; i < jobContext->multiThreadLevel; ++i) {
-        IntermediateVec& vec = (jobContext->threadContexts + i)->intermediateVec;
-        if (!vec.empty() && (!largestPair || *largestPair->first < *vec.back().first )) {
+        IntermediateVec &vec = (jobContext->threadContexts + i)->intermediateVec;
+        if (!vec.empty() && (!largestPair || *largestPair->first < *vec.back().first)) {
             largestPair = &vec.back();
         }
     }
 
-    return largestPair ? *largestPair : IntermediatePair(nullptr, nullptr); // Return an empty pair if none found
+    return largestPair ? *largestPair : IntermediatePair(nullptr,
+                                                         nullptr); // Return an empty pair if none found
 }
 
 /**
@@ -385,17 +393,19 @@ IntermediatePair findLargestKey(JobContext* jobContext) {
  * @param largestPair - The key to match against.
  * @return A vector of all pairs matching the largest key.
  */
-std::vector<IntermediatePair> collectPairsWithKey(JobContext* jobContext, const IntermediatePair& largestPair) {
+std::vector<IntermediatePair>
+collectPairsWithKey(JobContext *jobContext, const IntermediatePair &largestPair) {
     std::vector<IntermediatePair> collectedPairs;
 
     for (int i = 0; i < jobContext->multiThreadLevel; ++i) {
-        IntermediateVec& vec = jobContext->threadContexts[i].intermediateVec;
+        IntermediateVec &vec = jobContext->threadContexts[i].intermediateVec;
 
         // Use a reverse iterator to efficiently pop from the back of the vector
-        for (auto rit = vec.rbegin(); rit != vec.rend(); ) {
+        for (auto rit = vec.rbegin(); rit != vec.rend();) {
             if (!(*rit->first < *largestPair.first) && !(*largestPair.first < *rit->first)) {
                 collectedPairs.push_back(*rit);
-                rit = std::vector<IntermediatePair>::reverse_iterator(vec.erase((++rit).base())); // Erase and move iterator back to the next element
+                rit = std::vector<IntermediatePair>::reverse_iterator(
+                        vec.erase((++rit).base())); // Erase and move iterator back to the next element
             } else {
                 break; // Since we're assuming vec is sorted, or we are looking for the largest key until mismatch
             }
@@ -410,16 +420,16 @@ std::vector<IntermediatePair> collectPairsWithKey(JobContext* jobContext, const 
  * Updates the shuffle progress in the job context based on current state.
  * @param jobContext - Context containing job details and current progress.
  */
-void updateShuffleProgress(JobContext* jobContext) {
+void updateShuffleProgress(JobContext *jobContext) {
     jobContext->jobState.percentage = static_cast<float>(jobContext->shuffleArray.size())
-            / jobContext->maxSize * 100.0f;
+                                      / jobContext->maxSize * 100.0f;
 }
 
 /**
  * Executes the shuffle operation, organizing data into shuffled arrays by key.
  * @param jobContext - struct that holds all the information in this job.
  */
-void executeShuffleOperation(JobContext* jobContext) {
+void executeShuffleOperation(JobContext *jobContext) {
     configureShuffleEnvironment(jobContext);
 
     while (jobContext->jobState.percentage < 100) {
@@ -437,7 +447,6 @@ void executeShuffleOperation(JobContext* jobContext) {
 }
 
 
-
 /**
  * Sorts the intermediate vector for the current thread based on keys
  * @param threadCtx - ThreadContext structure associated with the thread
@@ -452,83 +461,100 @@ void sortIntermediatePairsByKeys(ThreadContext *threadCtx) {
 
 
 /**
- * hold the current running until the job will be finished.
- * we will split the behaviour into 3 options by waitFlag. (0 = join(wait) for all the threadHandles,
- *                                                           1 = wait for already waiting thread
- *                                                           2 = the job already finished - dont wait)
- * @param job struct that hold all the information in this job
+ * Waits for the job to complete based on the specified waitFlag.
+ *
+ * The behavior of this function is determined by the waitFlag in the job:
+ * - 0: Waits for all threads associated with the job to complete (joins all thread handles).
+ * - 1: Waits for a specific already waiting thread.
+ * - 2: The job has already finished, so no waiting is necessary.
+ *
+ * @param job A JobHandle that holds all the information related to this job.
  */
-void waitForJob(JobHandle job){
-    JobContext* cur_job = ((JobContext*) job);
-    // job already finished
-    if(cur_job->waitFlag == 2){
+void waitForJob(JobHandle job) {
+    JobContext *curJob = ((JobContext *) job);
+    if (curJob->waitFlag == 2) {
         return;
     }
-    // first time we enter this function - wait for all the threadHandles to terminate
-    if (cur_job->waitFlag == 0){
-        cur_job->waitFlag = 1;
-        for (int i = 0; i < cur_job->multiThreadLevel; i++) {
-            pthread_join(cur_job->threadHandles[i], NULL);
-        }
-        if (pthread_cond_broadcast(&cur_job->conditionVar) != 0) {
-            fprintf(stderr, "[[Barrier]] error on pthread_cond_broadcast");
-            exit(1);
-        }
-        cur_job->waitFlag = 2;
+    if (pthread_mutex_lock(&curJob->waitMutex) != 0) {
+        perror("Failed to lock stage mutex at shuffle initialization");
+        exit(EXIT_FAILURE);
+    }
+    if (curJob->waitFlag == 0) {
+        waitFirstThread(curJob);
     }
     // more than one time we enter this function and the job still processing.
-    if (cur_job->waitFlag == 1){
-        if (pthread_cond_wait(&cur_job->conditionVar, &cur_job->barrierMutex) != 0){
+    if (curJob->waitFlag == 1) {
+        if (pthread_cond_wait(&curJob->conditionVar, &curJob->barrierMutex) != 0) {
             fprintf(stderr, "[[Barrier]] error on pthread_cond_wait");
             exit(1);
         }
     }
 }
 
+
 /**
- * take the JobState from the struct JobContext all the function is in mutex
- * @param job - struct that hold all the information in this job
- * @param state - JobState to insert the job state
+ * Waits for all threads associated with the job to complete and updates the waitFlag accordingly.
+ * @param curJob A pointer to the JobContext structure representing the current job.
  */
-void getJobState(JobHandle job, JobState* state){
-    JobContext* cur_job = (JobContext*)job;
-    if (pthread_mutex_lock(&cur_job->stageMutex) != 0){
+void waitFirstThread(JobContext *curJob) {
+    curJob->waitFlag = 1;
+    if (pthread_mutex_unlock(&curJob->waitMutex) != 0) {
+        perror("Failed to unlock stage mutex after shuffle setup");
+        exit(EXIT_FAILURE);
+    }
+    for (int i = 0; i < curJob->multiThreadLevel; i++) {
+        pthread_join(curJob->threadHandles[i], NULL);
+    }
+    if (pthread_cond_broadcast(&curJob->conditionVar) != 0) {
+        fprintf(stderr, "[[Barrier]] error on pthread_cond_broadcast");
+        exit(1);
+    }
+    curJob->waitFlag = 2;
+}
+
+/**
+ * Retrieve the JobState from the struct JobContext.
+ * @param job - struct that holds all the information in this job.
+ * @param state - JobState to insert the job state.
+ */
+void getJobState(JobHandle job, JobState *state) {
+    auto *curJob = (JobContext *) job;
+    if (pthread_mutex_lock(&curJob->stageMutex) != 0) {
         fprintf(stderr, "[[In getJobState]] error on pthread_mutex_lock");
         exit(1);
     }
-    *state = ((JobContext*) job)->jobState;
-    if (pthread_mutex_unlock(&cur_job->stageMutex) != 0){
+    *state = curJob->jobState;
+    if (pthread_mutex_unlock(&curJob->stageMutex) != 0) {
         fprintf(stderr, "[[In getJobState]] error on pthread_mutex_unlock");
         exit(1);
     }
-
 }
 
 /**
  * delete all the memory and destroy all the mutex/cond
  * @param job  - struct that hold all the information in this job
  */
-void closeJobHandle(JobHandle job){
+void closeJobHandle(JobHandle job) {
     waitForJob(job);
-    JobContext* cur_job = ((JobContext*) job);
-    check_destroy(pthread_mutex_destroy(&cur_job->barrierMutex));
-    check_destroy(pthread_mutex_destroy(&cur_job->stageMutex));
-    check_destroy(pthread_mutex_destroy(&cur_job->counterMutex));
-    check_destroy(pthread_mutex_destroy(&cur_job->vectorMutex));
-    check_destroy(pthread_cond_destroy(&cur_job->conditionVar));
-    delete[] cur_job->threadHandles;
-    delete[] cur_job->threadContexts;
-    delete cur_job->counterAtomic;
-    delete cur_job->barrier;
-    delete cur_job;
+    JobContext *curJob = ((JobContext *) job);
+    DestroyMutex(pthread_mutex_destroy(&curJob->barrierMutex));
+    DestroyMutex(pthread_mutex_destroy(&curJob->stageMutex));
+    DestroyMutex(pthread_mutex_destroy(&curJob->counterMutex));
+    DestroyMutex(pthread_mutex_destroy(&curJob->vectorMutex));
+    DestroyMutex(pthread_cond_destroy(&curJob->conditionVar));
+    delete[] curJob->threadHandles;
+    delete[] curJob->threadContexts;
+    delete curJob->counterAtomic;
+    delete curJob->barrier;
+    delete curJob;
 }
 
 /**
  * check if the destroy of the mutex or cond work , if not print and exit
- * @param check_input - function to check
+ * @param checkReturnValue - function to check
  */
-void check_destroy(int check_input) {
-    if (check_input != 0) {
+void DestroyMutex(int checkReturnValue) {
+    if (checkReturnValue != 0) {
         fprintf(stderr, "[[closeJobHandle]] error on pthread_mutex/cond_destroy");
         exit(1);
     }
