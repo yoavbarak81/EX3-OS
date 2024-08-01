@@ -214,7 +214,10 @@ JobHandle startMapReduceJob(const MapReduceClient &client,
 
     // Create threads
     for (int i = 0; i < multiThreadLevel; ++i) {
-        pthread_create(&threads[i], nullptr, threadRun, &threadContexts[i]);
+        if (pthread_create(&threads[i], nullptr, threadRun, &threadContexts[i]) != 0){
+            fprintf(stdout, "system error: Unable to create a new thread.\n");
+            exit(EXIT_FAILURE);
+        }
     }
 
     return jobContext;
@@ -261,6 +264,7 @@ void *threadRun(void *_arg) {
     threadContext->jobContext->barrier->barrier(threadContext->jobContext);
 
     executeReduce(threadContext);
+    return nullptr;
 }
 
 /**
