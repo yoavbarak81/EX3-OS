@@ -89,11 +89,11 @@ Barrier::Barrier(int numThreads)
 
 Barrier::~Barrier() {
     if (pthread_mutex_destroy(&mutex) != 0) {
-        fprintf(stderr, "[[Barrier]] error on pthread_mutex_destroy");
+        fprintf(stdout, "system error: on pthread_mutex_destroy.\n");
         exit(1);
     }
     if (pthread_cond_destroy(&cv) != 0) {
-        fprintf(stderr, "[[Barrier]] error on pthread_cond_destroy");
+        fprintf(stdout, "system error: on pthread_cond_destroy.\n");
         exit(1);
     }
 }
@@ -101,12 +101,12 @@ Barrier::~Barrier() {
 
 void Barrier::barrier(JobContext *jobContext) {
     if (pthread_mutex_lock(&mutex) != 0) {
-        fprintf(stderr, "[[Barrier]] error on pthread_mutex_lock");
+        fprintf(stdout, "system error: on pthread_mutex_lock.\n");
         exit(1);
     }
     if (++count < numThreads) {
         if (pthread_cond_wait(&cv, &mutex) != 0) {
-            fprintf(stderr, "[[Barrier]] error on pthread_cond_wait");
+            fprintf(stdout, "system error: on pthread_cond_wait.\n");
             exit(1);
         }
     } else {
@@ -115,12 +115,12 @@ void Barrier::barrier(JobContext *jobContext) {
         InitReduceStage(jobContext);
 
         if (pthread_cond_broadcast(&cv) != 0) {
-            fprintf(stderr, "[[Barrier]] error on pthread_cond_broadcast");
+            fprintf(stdout, "system error: on pthread_cond_broadcast.\n");
             exit(1);
         }
     }
     if (pthread_mutex_unlock(&mutex) != 0) {
-        fprintf(stderr, "[[Barrier]] error on pthread_mutex_unlock");
+        fprintf(stdout, "system error: on pthread_mutex_unlock.\n");
         exit(1);
     }
 }
@@ -137,12 +137,12 @@ void emit2(K2 *key, V2 *value, void *context) {
     auto *threadContext = static_cast<ThreadContext *>(context);
     IntermediatePair intermediatePair = std::make_pair(key, value);
     if (pthread_mutex_lock(&threadContext->jobContext->vectorMutex) != 0) {
-        fprintf(stderr, "[emit2: Failed to lock vectorMutex before adding pair]");
+        fprintf(stdout, "system error: emit2 failed to lock vectorMutex before adding pair.\n");
         exit(EXIT_FAILURE);
     }
     threadContext->intermediateVec.push_back(intermediatePair);
     if (pthread_mutex_unlock(&threadContext->jobContext->vectorMutex) != 0) {
-        fprintf(stderr, "[emit2: Failed to unlock vectorMutex after adding pair]");
+        fprintf(stdout, "system error: emit2 failed to unlock vectorMutex after adding pair.\n");
         exit(EXIT_FAILURE);
     }
 }
@@ -159,12 +159,12 @@ void emit3(K3 *key, V3 *value, void *context) {
     auto *threadContext = static_cast<ThreadContext *>(context);
     OutputPair newOutputPair = std::make_pair(key, value);
     if (pthread_mutex_lock(&threadContext->jobContext->vectorMutex) != 0) {
-        fprintf(stderr, "[emit3: Failed to lock vectorMutex before adding output pair]");
+        fprintf(stderr, "system error: emit3 failed to lock vectorMutex before adding output pair.\n");
         exit(EXIT_FAILURE);
     }
     threadContext->jobContext->outputVec->push_back(newOutputPair);
     if (pthread_mutex_unlock(&threadContext->jobContext->vectorMutex) != 0) {
-        fprintf(stderr, "[emit3: Failed to unlock vectorMutex after adding output pair]");
+        fprintf(stderr, "system error: emit3 failed to unlock vectorMutex after adding output pair.\n");
         exit(EXIT_FAILURE);
     }
 }
@@ -283,7 +283,7 @@ unsigned long getInputPairIndex(ThreadContext *threadContext) {
 
 void atomicCounterHandler(ThreadContext *threadContext) {
     if (pthread_mutex_lock(&threadContext->jobContext->counterMutex) != 0) {
-        fprintf(stderr, "[updateAtomicCounter] Error: Unable to lock counterMutex (code %d).\n");
+        fprintf(stdout, "system error: Unable to lock counterMutex .\n");
         exit(EXIT_FAILURE);
     }
 
@@ -299,7 +299,7 @@ void atomicCounterHandler(ThreadContext *threadContext) {
     threadContext->jobContext->jobState.percentage = completionRate;
 
     if (pthread_mutex_unlock(&threadContext->jobContext->counterMutex) != 0) {
-        fprintf(stderr, "[updateAtomicCounter] Error: Unable to unlock counterMutex (code %d).\n");
+        fprintf(stdout, "system error: Unable to unlock counterMutex.\n");
         exit(EXIT_FAILURE);
     }
 
@@ -342,7 +342,7 @@ void InitReduceStage(JobContext *jobContext) {
  */
 void configureShuffleEnvironment(JobContext *jobDetails) {
     if (pthread_mutex_lock(&jobDetails->stageMutex) != 0) {
-        perror("Failed to lock stage mutex at shuffle initialization");
+        fprintf(stdout, "system error: Failed to lock stage mutex at shuffle initialization.\n");
         exit(EXIT_FAILURE);
     }
 
@@ -364,7 +364,7 @@ void configureShuffleEnvironment(JobContext *jobDetails) {
     jobDetails->counterAtomic->fetch_add(pairCount << 31);
 
     if (pthread_mutex_unlock(&jobDetails->stageMutex) != 0) {
-        perror("Failed to unlock stage mutex after shuffle setup");
+        fprintf(stdout, "system error: Failed to unlock stage mutex after shuffle setup.\n");
         exit(EXIT_FAILURE);
     }
 }
@@ -480,7 +480,7 @@ void waitForJob(JobHandle job) {
         return;
     }
     if (pthread_mutex_lock(&curJob->waitMutex) != 0) {
-        perror("Failed to lock stage mutex at shuffle initialization");
+        fprintf(stdout, "system error: Failed to lock stage mutex at shuffle initialization.\n");
         exit(EXIT_FAILURE);
     }
     if (curJob->waitFlag == 0) {
@@ -489,8 +489,8 @@ void waitForJob(JobHandle job) {
     // more than one time we enter this function and the job still processing.
     if (curJob->waitFlag == 1) {
         if (pthread_cond_wait(&curJob->conditionVar, &curJob->barrierMutex) != 0) {
-            fprintf(stderr, "[[Barrier]] error on pthread_cond_wait");
-            exit(1);
+            fprintf(stderr, "system error: on pthread_cond_wait.\n");
+            exit(EXIT_FAILURE);
         }
     }
 }
@@ -503,15 +503,15 @@ void waitForJob(JobHandle job) {
 void waitFirstThread(JobContext *curJob) {
     curJob->waitFlag = 1;
     if (pthread_mutex_unlock(&curJob->waitMutex) != 0) {
-        perror("Failed to unlock stage mutex after shuffle setup");
+        fprintf(stdout, "system error: Failed to unlock stage mutex after shuffle setup.\n");
         exit(EXIT_FAILURE);
     }
     for (int i = 0; i < curJob->multiThreadLevel; i++) {
         pthread_join(curJob->threadHandles[i], NULL);
     }
     if (pthread_cond_broadcast(&curJob->conditionVar) != 0) {
-        fprintf(stderr, "[[Barrier]] error on pthread_cond_broadcast");
-        exit(1);
+        fprintf(stdout, "system error: on pthread_cond_broadcast.\n");
+        exit(EXIT_FAILURE);
     }
     curJob->waitFlag = 2;
 }
@@ -524,13 +524,13 @@ void waitFirstThread(JobContext *curJob) {
 void getJobState(JobHandle job, JobState *state) {
     auto *curJob = (JobContext *) job;
     if (pthread_mutex_lock(&curJob->stageMutex) != 0) {
-        fprintf(stderr, "[[In getJobState]] error on pthread_mutex_lock");
-        exit(1);
+        fprintf(stdout, "system error: on pthread_mutex_lock.\n");
+        exit(EXIT_FAILURE);
     }
     *state = curJob->jobState;
     if (pthread_mutex_unlock(&curJob->stageMutex) != 0) {
-        fprintf(stderr, "[[In getJobState]] error on pthread_mutex_unlock");
-        exit(1);
+        fprintf(stdout, "system error: on pthread_mutex_unlock.\n");
+        exit(EXIT_FAILURE);
     }
 }
 
@@ -559,7 +559,7 @@ void closeJobHandle(JobHandle job) {
  */
 void DestroyMutex(int checkReturnValue) {
     if (checkReturnValue != 0) {
-        fprintf(stderr, "[[closeJobHandle]] error on pthread_mutex/cond_destroy");
-        exit(1);
+        fprintf(stdout, "system error: on pthread_mutex/cond_destroy.\n");
+        exit(EXIT_FAILURE);
     }
 }
